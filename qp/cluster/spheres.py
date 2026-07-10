@@ -1152,6 +1152,7 @@ def extract_clusters(
     xyz=True,
     hetero_pdb=False,
     include_ligands=2,
+    cluster_name_template=None,
     **smooth_params
 ):
     """Extract active site coordination spheres using Voronoi tessellation.
@@ -1196,6 +1197,37 @@ def extract_clusters(
     include_ligands : int, optional
         Ligand inclusion mode: 0 = first sphere only unless in ``ligands``,
         1 = all non-water, 2 = all (default 2).
+    cluster_name_template : str, optional
+        Python format-string controlling cluster directory/file names.
+        Defaults to ``None``, which preserves the original behavior of
+        naming each cluster after its chain + residue number(s), e.g.
+        ``A199``, or ``A1_A2_A3_A4`` for a cluster merging several centers
+        (see ``merge_cutoff``). This can produce filenames long enough to
+        exceed OS path length limits (notably on Windows) when many
+        residues are merged into one center, so a template can be supplied
+        instead. The template is evaluated once per cluster with these
+        fields available:
+
+        - ``radius``: ``first_sphere_radius``, formatted without a
+          trailing ``.0`` (e.g. ``4`` or ``3.5``).
+        - ``metal_id``: the original chain + residue string, e.g. ``A199``.
+        - ``index``: 1-based count of the cluster within this call
+          (1, 2, 3, ...).
+        - ``pdb``: the base name of ``out`` (typically the PDB ID).
+
+        For example ``"A_{radius}"`` names clusters like ``A_4``, and
+        ``"cluster_{index}"`` names them ``cluster_1``, ``cluster_2``, etc.
+        If two clusters in the same call resolve to the same name (e.g.
+        several distinct centers sharing one radius), a numeric suffix is
+        appended automatically so nothing gets overwritten (``A_4``,
+        ``A_4_1``, ``A_4_2``, ...). ``charge.csv`` and ``count.csv`` rows
+        are keyed by the final cluster name (not ``metal_id``), since
+        downstream QM job creation (``qp create``/``qp submit``) looks up
+        each cluster's charge by matching its directory name against
+        these files. When a template renames a cluster away from its
+        residue-based ``metal_id``, that original identity is instead
+        recorded in ``cluster_name_map.csv`` (``cluster_name,metal_id``)
+        so it isn't lost.
     **smooth_params
         Additional parameters for the smoothing method.
 
@@ -1203,7 +1235,8 @@ def extract_clusters(
     -------
     list of str
         Paths to the generated cluster directories (e.g.,
-        ``['out/A199', 'out/B350']``).
+        ``['out/A199', 'out/B350']``, or ``['out/A_4', 'out/A_4_1']`` with
+        ``cluster_name_template="A_{radius}"``).
     """
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("PDB", path)
@@ -1218,21 +1251,53 @@ def extract_clusters(
     aa_charge = {}
     res_count = {}
     cluster_paths = []
-    for c in centers:
+    cluster_names_used = {}
+    cluster_name_map = {}
+    pdb_name = os.path.basename(os.path.normpath(out))
+    for index, c in enumerate(centers, start=1):
         metal_id, residues, spheres = get_next_neighbors(
             c, neighbors, sphere_count, ligands, first_sphere_radius, smooth_method, include_ligands, **smooth_params
         )
         complete_oligomer(ligand_charge, model, residues, spheres, include_ligands)
-        cluster_path = f"{out}/{metal_id}"
+
+        if cluster_name_template:
+            name_fields = {
+                "radius": f"{first_sphere_radius:g}",
+                "metal_id": metal_id,
+                "index": index,
+                "pdb": pdb_name,
+            }
+            try:
+                cluster_name = cluster_name_template.format(**name_fields)
+            except (KeyError, IndexError) as e:
+                raise ValueError(
+                    f"Invalid cluster_name_template {cluster_name_template!r}: "
+                    f"unknown field {e}. Available fields: {sorted(name_fields)}"
+                ) from e
+        else:
+            cluster_name = metal_id
+
+        # Guard against two clusters resolving to the same name (e.g. several
+        # distinct centers sharing the same radius) so nothing overwrites.
+        if cluster_name in cluster_names_used:
+            cluster_names_used[cluster_name] += 1
+            cluster_name = f"{cluster_name}_{cluster_names_used[cluster_name]}"
+        else:
+            cluster_names_used[cluster_name] = 0
+
+        cluster_path = f"{out}/{cluster_name}"
         cluster_paths.append(cluster_path)
         os.makedirs(cluster_path, exist_ok=True)
+
+        if cluster_name != metal_id:
+            cluster_name_map[cluster_name] = metal_id
 
         if max_atom_count is not None:
             prune_atoms(c, residues, spheres, max_atom_count, ligands)
         if charge:
-            aa_charge[metal_id] = compute_charge(spheres, structure, ligand_charge, center_residue)
+            aa_charge[cluster_name] = compute_charge(spheres, structure, ligand_charge, center_residue)
         if count:
-            res_count[metal_id] = count_residues(spheres)
+            res_count[cluster_name] = count_residues(spheres)
         if capping:
             cap_residues = cap_chains(model, residues, capping)
             if capping == 2:
@@ -1247,8 +1312,8 @@ def extract_clusters(
             for cap in cap_residues:
                 cap.get_parent().detach_child(cap.get_id())
         if xyz:
-            struct_to_file.to_xyz(f"{cluster_path}/{metal_id}.xyz", *sphere_paths)
-            struct_to_file.combine_pdbs(f"{cluster_path}/{metal_id}.pdb", center_residue, *sphere_paths, hetero_pdb=hetero_pdb)
+            struct_to_file.to_xyz(f"{cluster_path}/{cluster_name}.xyz", *sphere_paths)
+            struct_to_file.combine_pdbs(f"{cluster_path}/{cluster_name}.pdb", center_residue, *sphere_paths, hetero_pdb=hetero_pdb)
 
     if charge:
         with open(f"{out}/charge.csv", "w") as f:
@@ -1268,6 +1333,15 @@ def extract_clusters(
                     s = ", ".join(f"{r} {c}" for r, c in sorted(sphere.items()))
                     f.write(f',"{s}"')
                 f.write("\n")
+
+    if cluster_name_map:
+        # Only written when cluster_name_template renamed at least one
+        # cluster away from its residue-based metal_id, so the mapping
+        # back to the original chain/residue identity isn't lost.
+        with open(f"{out}/cluster_name_map.csv", "w") as f:
+            f.write("cluster_name,metal_id\n")
+            for cluster_name, metal_id in sorted(cluster_name_map.items()):
+                f.write(f"{cluster_name},{metal_id}\n")
 
     return cluster_paths
 

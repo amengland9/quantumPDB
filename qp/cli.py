@@ -96,6 +96,7 @@ def run(config):
         count = config_data.get('count_residues', True)
         xyz = config_data.get('write_xyz', True)
         hetero_pdb = config_data.get('write_hetero_pdb', False)
+        cluster_name_template = config_data.get('cluster_name_template', None)
         smooth_choice = config_data.get('smoothing_method', 2)
         smooth_options = {0: {}, 1: {"eps": 6, "min_samples": 3}, 2: {"mean_distance": 3}, 3: {}}
         smooth_method_options = {0: "box_plot", 1: "dbscan", 2: "dummy_atom", 3: False}
@@ -274,6 +275,7 @@ def run(config):
                     path, f"{output}/{pdb}", center_residue, sphere_count, 
                     first_sphere_radius, max_atom_count, merge_cutoff, smooth_method,
                     ligands, capping, charge, ligand_charge, count, xyz, hetero_pdb, include_ligands,
+                    cluster_name_template=cluster_name_template,
                     **smooth_params
                 )
 

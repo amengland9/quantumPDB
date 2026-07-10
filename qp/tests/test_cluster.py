@@ -108,3 +108,77 @@ def test_prune_atoms(tmpdir, sample_cluster):
         smooth_method="dummy_atom", mean_distance=3
     )
     check_clusters(path, tmpdir, metal_ids)
+
+
+@pytest.mark.parametrize("sample_cluster", [
+    ("2chb", (
+        "A1_A2_A3_A4",
+        "B1_B2_B3_B4_B5",
+        "C1_C2_C3_C4",
+        "I1_I2_I3_I4_I5",
+        "J1_J2_J3_J4_J5"
+    ))
+], indirect=True)
+def test_cluster_name_template(tmpdir, sample_cluster):
+    """cluster_name_template should produce short, collision-free names
+    (avoiding the long residue-concatenated names in the default case,
+    which can exceed path length limits when many centers are merged),
+    while the underlying sphere geometry stays identical."""
+    pdb, metal_ids, path = sample_cluster
+    pdb_path = os.path.join(path, "Protoss", f"{pdb}_protoss.pdb")
+    spheres.extract_clusters(
+        pdb_path, tmpdir, ["BGC", "GAL", "NGA", "SIA", "NI"],
+        merge_cutoff=4.0,
+        smooth_method="dummy_atom", mean_distance=3,
+        first_sphere_radius=4.0,
+        cluster_name_template="A_{radius}"
+    )
+
+    expected_names = ["A_4", "A_4_1", "A_4_2", "A_4_3", "A_4_4"]
+    for name in expected_names:
+        assert os.path.isdir(os.path.join(tmpdir, name)), f"Expected cluster dir {name} not found"
+
+    # No unexpected directories, and no collisions/overwrites occurred
+    generated_dirs = sorted(
+        d for d in os.listdir(tmpdir)
+        if os.path.isdir(os.path.join(tmpdir, d))
+    )
+    assert generated_dirs == sorted(expected_names)
+
+    # Sphere geometry should be identical to the default-naming output, just
+    # under new directory names. Centers aren't guaranteed to be processed
+    # in a fixed order (get_center_residues iterates over a set), so match
+    # each generated cluster to its expected counterpart by content rather
+    # than by position.
+    remaining_expected = list(metal_ids)
+    for new_name in expected_names:
+        output_pdb_0 = os.path.join(tmpdir, new_name, "0.pdb")
+        match = None
+        for old_name in remaining_expected:
+            expected_pdb_0 = os.path.join(path, old_name, "0.pdb")
+            if filecmp.cmp(expected_pdb_0, output_pdb_0):
+                match = old_name
+                break
+        assert match is not None, f"Generated cluster {new_name} does not match any expected cluster"
+        remaining_expected.remove(match)
+
+        sphere_count = len(glob.glob(os.path.join(path, match, "?.pdb")))
+        for i in range(sphere_count):
+            expected_pdb = os.path.join(path, match, f"{i}.pdb")
+            output_pdb = os.path.join(tmpdir, new_name, f"{i}.pdb")
+            assert filecmp.cmp(expected_pdb, output_pdb), (
+                f"Sphere {i} PDB for {match} -> {new_name} does not match expected"
+            )
+    assert not remaining_expected, "Not all expected clusters were matched"
+
+
+def test_cluster_name_template_bad_field(tmpdir):
+    """An unknown field in the template should raise a clear error rather
+    than failing silently or with a confusing traceback."""
+    with pytest.raises(ValueError, match="cluster_name_template"):
+        spheres.extract_clusters(
+            os.path.join(os.path.dirname(__file__), "samples", "1lm6", "Protoss", "1lm6_protoss.pdb"),
+            tmpdir, ["FE", "FE2"],
+            smooth_method="box_plot",
+            cluster_name_template="A_{not_a_real_field}"
+        )
