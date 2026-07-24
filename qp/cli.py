@@ -106,32 +106,60 @@ def run(config):
         if capping or charge:
             protoss = True
 
-    for pdb, path in pdb_all:
+    for pdb, path, source_cif in pdb_all:
         try:
             click.secho("╔══════╗", bold=True)
             click.secho(f"║ {pdb.upper()} ║", bold=True)
             click.secho("╚══════╝", bold=True)
 
-            # Skips fetching if PDB file exists
+            # Fetch classic PDB, or convert local/RCSB mmCIF when needed
             if not os.path.isfile(path):
-                click.echo(f"> Fetching PDB file")
+                if source_cif:
+                    click.echo("> Preparing structure from local mmCIF")
+                else:
+                    click.echo("> Fetching structure file")
                 try:
-                    setup.fetch_pdb(pdb, path)
+                    setup.ensure_structure_pdb(pdb, path, source_cif=source_cif)
+                except setup.OversizedStructureError as e:
+                    # Skip oversized mmCIF conversions; keep batch running
+                    click.secho(
+                        f"> Warning: skipping oversized structure {pdb.upper()}: {e}\n",
+                        italic=True,
+                        fg="yellow",
+                    )
+                    err["PDB"].append(pdb)
+                    if center_residues:
+                        center_residues.pop(0)
+                    continue
                 except ValueError as e:
-                    # Catches invalid PDB ID
+                    # Catches invalid PDB ID / conversion failures
                     click.secho(f"> Error: {e}\n", italic=True, fg="red")
                     err["PDB"].append(pdb)
+                    if center_residues:
+                        center_residues.pop(0)
                     continue
                 except IOError as e:
                     # Catches network and server issues
                     click.secho(f"> Error: A server or network issue occurred. {e}\n", italic=True, fg="red")
                     err["PDB"].append(pdb)
+                    if center_residues:
+                        center_residues.pop(0)
                     continue
             
             # Extract the current center residue from the list of all residues
             from qp.cluster.spheres import CenterResidue
-            center_residue = CenterResidue(center_residues.pop(0))
+            from qp.structure.mmcif_to_pdb import load_remap_sidecar
+            # Allow center specs to use original mmCIF residue names (e.g. 5-letter CCD)
+            remap = load_remap_sidecar(path)
+            center_residue = CenterResidue(
+                center_residues.pop(0),
+                resname_map=remap.get("resname_map"),
+            )
             click.echo(f"> Using center residue: {center_residue}")
+            if remap.get("resname_map"):
+                click.echo(
+                    f"> mmCIF resname remap available for center matching: {remap['resname_map']}"
+                )
             
             residues_with_clashes = [] # Start by assuming no protoss clashes
             for i in range(max_clash_refinement_iter):
