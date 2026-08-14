@@ -30,7 +30,7 @@ def test_parse_input(tmpdir):
     expected_pdbs = [(p, os.path.join(tmpdir, p, f"{p}.pdb"), None) for p in pdbs]
     # Local .pdb path keeps the absolute input path rather than the download target
     expected_pdbs[-1] = ("4ilv", pdb_path, None)
-    output_pdbs, output_centers = setup.parse_input(
+    output_pdbs, output_centers, _, _ = setup.parse_input(
         input_pdbs, tmpdir, center_yaml_residues
     )
     assert expected_pdbs == output_pdbs, "Parsed input does not match expected"

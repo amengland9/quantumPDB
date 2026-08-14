@@ -9,7 +9,9 @@
     ...     "path/to/out/dir/", 
     ...     center_residues=["FE", "FE2"], # List of resnames of the residues to use as the cluster center
     ...     sphere_count=2,              # Number of spheres to extract
-    ...     ligands=["AKG"]       # PDB IDs of additional ligands
+    ...     ligands=["AKG"],       # PDB IDs of additional ligands
+    ...     force_include_residues=["HIS_A123"], # Specific protein residues to force-include
+    ...     force_remove_residues=["HIS_A45"] # Specific protein residues to force-exclude
     ... )
 
 Extracting clusters leaves open valences in the outermost sphere. Capping may be
@@ -618,7 +620,7 @@ def get_next_neighbors(
     return "_".join(sorted(metal_id)), reduce(lambda x, y: x | y, spheres), spheres
 
 
-def prune_atoms(center, residues, spheres, max_atom_count, ligands, kept_monomers=None):
+def prune_atoms(center, residues, spheres, max_atom_count, ligands, protected_residues=frozenset(), kept_monomers=None):
     """Prune residues from the cluster to meet the max atom count constraint.
 
     Removes residues furthest from the center first, while preserving
@@ -637,6 +639,10 @@ def prune_atoms(center, residues, spheres, max_atom_count, ligands, kept_monomer
         Maximum allowed total atom count in the cluster.
     ligands : list
         Ligand residue names to preserve regardless of distance.
+    protected_residues : set, optional
+        Specific residues (e.g. from ``force_include_residues``) to preserve
+        regardless of distance, matched by identity rather than resname
+        (default frozenset()).
     kept_monomers : list, optional
         Oligomer monomers that must be preserved from pruning.
 
@@ -659,11 +665,16 @@ def prune_atoms(center, residues, spheres, max_atom_count, ligands, kept_monomer
         center_atoms.extend(c.get_unpacked_list())
     def dist(res):
         return min(atom - x for x in center_atoms for atom in res.get_unpacked_list())
-                   
+
     prune = set()
     for res in sorted(residues, key=dist, reverse=True):
-        # Check if the residue is in the ligands_to_keep list
-        if res.get_resname() not in ligands and res not in kept_monomers:
+        # Check if the residue is in the ligands_to_keep list, explicitly
+        # protected (e.g. force_include_residues), or a kept oligomer monomer
+        if (
+            res.get_resname() not in ligands
+            and res not in protected_residues
+            and res not in kept_monomers
+        ):
             prune.add(res)
             atom_cnt -= len(res)
             if atom_cnt <= max_atom_count:
@@ -1569,6 +1580,96 @@ def find_RGP_atoms(structure: Structure, RGP_atoms: Dict[str, Dict[int, Dict[str
                     RGP_atom_info["linking_atom"] = atom
 
 
+def add_force_include_residues(model, residues, spheres, force_include_residues):
+    """Force-include specific protein residues, even beyond the grown spheres.
+
+    Unlike the sphere-growth logic in ``get_next_neighbors``, this does not
+    rely on distance cutoffs or Voronoi adjacency — it matches each entry
+    directly against every residue in the model, so residues that are
+    structurally or functionally relevant but were never reached by sphere
+    growth (e.g. a distal second-shell residue) can still be included.
+
+    Parameters
+    ----------
+    model : Bio.PDB.Model.Model
+        Full protein structure model.
+    residues : set
+        Current set of extracted residues (modified in place).
+    spheres : list of set
+        Sphere-separated residue sets; matches are added to the outermost
+        sphere (modified in place).
+    force_include_residues : list of str
+        Residue keys to force-include, in ``'RESNAME_CHAINID'`` format
+        (e.g. ``'HIS_A123'``), matching ``make_res_key``.
+
+    Returns
+    -------
+    set
+        Residues matching ``force_include_residues``, whether newly added or
+        already present in the cluster. Intended to be passed to
+        ``prune_atoms`` as ``protected_residues``.
+    """
+    requested = set(force_include_residues)
+    matched = set()
+    if not requested:
+        return matched
+    for chain in model:
+        for res in chain.get_unpacked_list():
+            res_key = make_res_key(res)
+            if res_key in requested:
+                matched.add(res)
+                requested.discard(res_key)
+                if res not in residues:
+                    residues.add(res)
+                    spheres[-1].add(res)
+                    print(f"> {res_key} added to cluster via force_include_residues")
+    for res_key in requested:
+        print(f"> WARNING: force_include_residues entry {res_key!r} was not found in the structure")
+    return matched
+
+
+def remove_force_remove_residues(residues, spheres, force_remove_residues, center):
+    """Force-exclude specific protein residues, even if sphere growth,
+    ``additional_ligands``, or ``force_include_residues`` would have
+    included them.
+
+    No model search is needed here (unlike ``add_force_include_residues``):
+    a residue that isn't already in ``residues`` has nothing to remove.
+
+    Parameters
+    ----------
+    residues : set
+        Current set of extracted residues (modified in place).
+    spheres : list of set
+        Sphere-separated residue sets (modified in place).
+    force_remove_residues : list of str
+        Residue keys to force-exclude, in ``'RESNAME_CHAINID'`` format
+        (e.g. ``'HIS_A123'``), matching ``make_res_key``.
+    center : set
+        The cluster's center residue(s). Removal requests matching the
+        center are ignored (with a warning) rather than honored, since
+        removing the center would make the cluster meaningless.
+    """
+    requested = set(force_remove_residues)
+    if not requested:
+        return
+    center_keys = {make_res_key(res) for res in center}
+    remove = set()
+    for res in list(residues):
+        res_key = make_res_key(res)
+        if res_key in requested:
+            if res_key in center_keys:
+                print(f"> WARNING: force_remove_residues entry {res_key!r} is part of the cluster center and was not removed")
+                continue
+            remove.add(res)
+            print(f"> {res_key} removed from cluster via force_remove_residues")
+    residues -= remove
+    for s in spheres:
+        s -= remove
+    while spheres and not spheres[-1]:
+        spheres.pop()
+
+
 def extract_clusters(
     path,
     out,
@@ -1587,6 +1688,8 @@ def extract_clusters(
     hetero_pdb=False,
     include_ligands=2,
     cluster_name_template=None,
+    force_include_residues=[],
+    force_remove_residues=[],
     RGP_atoms=None,
     **smooth_params
 ):
@@ -1633,6 +1736,20 @@ def extract_clusters(
         Ligand inclusion mode: 0 = first sphere only unless in ``ligands``,
         1 = all non-water, 2 = all (default 2), 3 = center / standard amino
         acids / waters only.
+    force_include_residues : list, optional
+        Specific protein residues to force-include, in ``'RESNAME_CHAINID'``
+        format (e.g. ``'HIS_A123'``), even if they lie beyond the grown
+        spheres. These residues are added to the outermost sphere, capped
+        like any other extracted residue, and protected from
+        ``max_atom_count`` pruning (default []).
+    force_remove_residues : list, optional
+        Specific protein residues to force-exclude, in ``'RESNAME_CHAINID'``
+        format, even if sphere growth, ``ligands``, or
+        ``force_include_residues`` would otherwise have included them.
+        Applied after ``force_include_residues``, so on conflict removal
+        wins. Cannot remove the cluster's center (ignored with a warning
+        instead). Shrink-only: nothing backfills the cluster to compensate
+        (default []).
     cluster_name_template : str, optional
         Python format-string controlling cluster directory/file names.
         Defaults to ``None``, which preserves the original behavior of
@@ -1701,6 +1818,8 @@ def extract_clusters(
             c, neighbors, sphere_count, ligands, first_sphere_radius, smooth_method, include_ligands, **smooth_params
         )
         kept_monomers = complete_oligomer(ligand_charge, model, residues, spheres, include_ligands)
+        added_residues = add_force_include_residues(model, residues, spheres, force_include_residues)
+        remove_force_remove_residues(residues, spheres, force_remove_residues, c)
 
         if cluster_name_template:
             name_fields = {
@@ -1736,7 +1855,7 @@ def extract_clusters(
 
         find_RGP_atoms(structure, RGP_atoms)
         if max_atom_count is not None:
-            prune_atoms(c, residues, spheres, max_atom_count, ligands, kept_monomers)
+            prune_atoms(c, residues, spheres, max_atom_count, ligands, added_residues, kept_monomers)
         if count:
             res_count[cluster_name] = count_residues(spheres)
         if capping:
