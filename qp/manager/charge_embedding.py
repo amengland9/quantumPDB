@@ -7,7 +7,6 @@ force fields.
 """
 
 import os
-import glob
 import json
 import shutil
 import warnings
@@ -372,95 +371,6 @@ def load_custom_charges(filepath):
     return charges
 
 
-def find_protoss_pdb(project_root, pdb_name):
-    """Case-insensitive lookup for the Protoss-processed PDB, if it exists.
-
-    Looks for ``<project_root>/out/<pdb_name>/Protoss/<pdb_name>_protoss.pdb``
-    (matched case-insensitively on the filename stem). Unlike
-    :func:`find_source_pdb`, this does NOT raise when nothing is found -
-    it returns ``None`` so the caller can fall back to the raw source PDB.
-
-    Parameters
-    ----------
-    project_root : str
-        Directory containing "out" (typically the cutoff folder, e.g.
-        ``.../p-m1/3A``).
-    pdb_name : str
-        Structure name (e.g. ``"p-m1"``) used to build the expected
-        Protoss output path.
-
-    Returns
-    -------
-    str or None
-        Full path to the matched Protoss PDB, or ``None`` if the
-        Protoss folder or a matching file inside it doesn't exist.
-    """
-    protoss_dir = os.path.join(project_root, "out", pdb_name, "Protoss")
-    if not os.path.isdir(protoss_dir):
-        return None
-
-    expected_stem = f"{pdb_name}_protoss".lower()
-    candidates = [
-        f for f in glob.glob(os.path.join(protoss_dir, "*.pdb"))
-        if os.path.splitext(os.path.basename(f))[0].lower() == expected_stem
-    ]
-    if len(candidates) == 0:
-        return None
-    if len(candidates) > 1:
-        raise RuntimeError(
-            f"Multiple .pdb files matching '{pdb_name}_protoss' found in "
-            f"{protoss_dir}: {candidates}. Refusing to guess which one to use."
-        )
-    return candidates[0]
-
-
-def find_source_pdb(search_dir, pdb_name):
-    """Case-insensitive lookup for a source .pdb matching pdb_name.
-
-    Searches search_dir (the project root, i.e. the directory containing
-    "out") for a .pdb file whose stem matches pdb_name case-insensitively.
-    This is the FALLBACK source used only when no Protoss-processed copy
-    exists (see :func:`find_protoss_pdb`) - e.g. when the user hasn't
-    run Protoss for this cutoff yet, or has prepared/protonated the
-    structure another way.
-
-    Parameters
-    ----------
-    search_dir : str
-        Directory to search (typically the project root above "out").
-    pdb_name : str
-        Structure name to match, case-insensitively, against .pdb stems
-        in search_dir.
-
-    Returns
-    -------
-    str
-        Full path to the matched .pdb file.
-
-    Raises
-    ------
-    FileNotFoundError
-        If no matching .pdb is found in search_dir.
-    RuntimeError
-        If more than one matching .pdb is found in search_dir.
-    """
-    candidates = [
-        f for f in glob.glob(os.path.join(search_dir, "*.pdb"))
-        if os.path.splitext(os.path.basename(f))[0].lower() == pdb_name.lower()
-    ]
-    if len(candidates) == 0:
-        raise FileNotFoundError(
-            f"No .pdb matching '{pdb_name}' found in {search_dir}. "
-            f"Expected the source structure here for charge embedding."
-        )
-    if len(candidates) > 1:
-        raise RuntimeError(
-            f"Multiple .pdb files matching '{pdb_name}' found in {search_dir}: "
-            f"{candidates}. Refusing to guess which one to use."
-        )
-    return candidates[0]
-
-
 def get_charges(charge_embedding_cutoff, charge_embedding_charges=None):
     """Generate the MM point charge embedding file (``ptchrges.xyz``).
 
@@ -486,26 +396,21 @@ def get_charges(charge_embedding_cutoff, charge_embedding_charges=None):
         shutil.rmtree(temporary_files_dir)
     os.mkdir(temporary_files_dir)
 
+    # QM jobs always run three levels below the output directory, at
+    # <output>/<pdb>/<chain>/<method>, so the pdb and chain names come from
+    # the cwd and the source structure sits two levels up at
+    # <output>/<pdb>/<pdb>.pdb. This is the original PDB named in the input
+    # file -- the same structure used for clustering when Protoss is skipped
+    # -- rather than a Protoss-processed copy, so charge embedding works when
+    # Protoss is bypassed. Deriving the path relative to the cwd keeps it
+    # correct no matter what the output directory is named (it is
+    # user-configurable via the ``output_dir`` config option).
     cwd_parts = os.path.normpath(os.getcwd()).split(os.sep)
     pdb_name = cwd_parts[-3]
     chain_name = cwd_parts[-2]
 
-    # Locate the project root (the directory containing "out") rather than
-    # assuming a fixed number of parent hops, so this holds across cutoffs
-    # (3-10A) where cluster nesting depth is identical but explicit is safer
-    # than implicit.
-    if "out" in cwd_parts:
-        project_root = os.sep.join(cwd_parts[:cwd_parts.index("out")])
-    else:
-        # Fallback to the old assumption if "out" isn't in the path
-        project_root = os.sep.join(cwd_parts[:-4])
-
-    # Prefer the Protoss-processed structure (correct protonation states,
-    # etc.) when it exists. Only fall back to the raw source PDB in the
-    # project root when no Protoss output is present for this structure.
-    protoss_pdb_path = find_protoss_pdb(project_root, pdb_name)
-    if protoss_pdb_path is None:
-        protoss_pdb_path = find_source_pdb(project_root, pdb_name)
+    pdb_dir = os.sep.join(cwd_parts[:-2])
+    source_pdb_path = os.path.join(pdb_dir, f"{pdb_name}.pdb")
     renamed_his_pdb_file = f'{temporary_files_dir}/{chain_name}_rename_his.pdb'
     if charge_embedding_charges is not None:
         ff_dict = load_custom_charges(charge_embedding_charges)
@@ -517,7 +422,7 @@ def get_charges(charge_embedding_cutoff, charge_embedding_charges=None):
     final_point_charges_file = "ptchrges.xyz"
 
     # Rename histidines
-    rename_and_clean_resnames(protoss_pdb_path, renamed_his_pdb_file)
+    rename_and_clean_resnames(source_pdb_path, renamed_his_pdb_file)
 
     # Parse the PDB file and dump charge information into the B-factor column
     parse_pdb(renamed_his_pdb_file, charges_pdb, ff_dict)
