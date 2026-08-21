@@ -371,6 +371,40 @@ def load_custom_charges(filepath):
     return charges
 
 
+def pdb_has_hydrogens(pdb_path):
+    """Return True if *pdb_path* contains any hydrogen atoms.
+
+    Uses the element column (77-78) when it is populated, otherwise infers
+    the element from the atom name. Used to detect whether a structure has
+    been protonated, since charge embedding assigns histidine protonation
+    states (HID/HIE/HIP) and MM charges from the hydrogens present.
+
+    Parameters
+    ----------
+    pdb_path : str
+        Path to the PDB file to inspect.
+
+    Returns
+    -------
+    bool
+        True if at least one hydrogen atom is found.
+    """
+    with open(pdb_path, 'r') as pdb_file:
+        for line in pdb_file:
+            if not (line.startswith('ATOM') or line.startswith('HETATM')):
+                continue
+            element = line[76:78].strip()
+            if not element:
+                # Fall back to the atom name: PDB hydrogens are often named
+                # with a leading digit (e.g. "1HD1"), so strip leading digits
+                # and take the first alphabetic character as the element.
+                atom_name = line[12:16].strip().lstrip('0123456789')
+                element = atom_name[:1]
+            if element.upper() == 'H':
+                return True
+    return False
+
+
 def get_charges(charge_embedding_cutoff, charge_embedding_charges=None):
     """Generate the MM point charge embedding file (``ptchrges.xyz``).
 
@@ -411,6 +445,22 @@ def get_charges(charge_embedding_cutoff, charge_embedding_charges=None):
 
     pdb_dir = os.sep.join(cwd_parts[:-2])
     source_pdb_path = os.path.join(pdb_dir, f"{pdb_name}.pdb")
+
+    # Charge embedding reads protonation states straight from the source
+    # structure, so warn if it has no hydrogens (e.g. a raw crystal structure
+    # that bypassed Protoss). The renaming/charge steps below would otherwise
+    # silently produce an incomplete embedding.
+    if not pdb_has_hydrogens(source_pdb_path):
+        warnings.warn(
+            f"The source structure '{source_pdb_path}' contains no hydrogen "
+            f"atoms, so it does not appear to be protonated. Charge embedding "
+            f"assigns histidine protonation states (HID/HIE/HIP) and MM point "
+            f"charges from the hydrogens present, so an unprotonated structure "
+            f"will produce an incomplete or incorrect embedding. Protonate the "
+            f"structure (e.g. with Protoss) before enabling charge embedding.",
+            stacklevel=2,
+        )
+
     renamed_his_pdb_file = f'{temporary_files_dir}/{chain_name}_rename_his.pdb'
     if charge_embedding_charges is not None:
         ff_dict = load_custom_charges(charge_embedding_charges)
