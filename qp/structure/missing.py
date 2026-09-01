@@ -46,12 +46,7 @@ Optimization level (``optimize`` argument in ``missing.build_model``):
 
 import os
 import warnings
-from modeller import log, Environ, Selection
-from modeller.automodel import AutoModel
-from modeller import alignment, model
 from Bio import PDB
-
-log.none()
 
 #: Amino acid 3 to 1 lookup table
 def define_residues():
@@ -139,7 +134,7 @@ def get_residues(path, AA):
             if res in AA and (line[13] == " " or line[13] == "1"): # want only the first model
                 chain = line[19]
                 rid = int(line[21:26])
-                ic = line[26]
+                ic = line[26] if len(line) > 26 else " "
                 missing_residues.setdefault(chain, set()).add(((rid, ic), AA[res], "R"))
 
         elif line.startswith("REMARK 470   "):  # missing atoms
@@ -147,14 +142,14 @@ def get_residues(path, AA):
             if res in AA and (line[13] == " " or line[13] == "1"):
                 chain = line[19]
                 rid = int(line[20:24])
-                ic = line[24]
+                ic = line[24] if len(line) > 24 else " "
                 missing_residues.setdefault(chain, set()).add(((rid, ic), AA[res], "A"))
 
         elif line.startswith("ATOM") or line.startswith("HETATM"):
             res = line[17:20]
             chain = line[21]
             rid = int(line[22:26])
-            ic = line[26]
+            ic = line[26] if len(line) > 26 else " "
 
             if chain != cur:
                 residues.append([])
@@ -190,10 +185,14 @@ def get_residues(path, AA):
                 chain = line[21]
             else:
                 chain = cur
+            # Append remaining missing residues for this chain, then start a new
+            # sequence bucket so the next polymer segment cannot continue the
+            # previous chain's residue list (tail cutting).
             if chain in missing_residues:
                 while ind[chain] < len(missing_residues[chain]):
                     residues[-1].append(missing_residues[chain][ind[chain]])
                     ind[chain] += 1
+            residues.append([])
 
     # Warn user about non-standard residues that Modeller treats as rigid bodies
     if nonstandard_residues:
@@ -300,6 +299,8 @@ def transfer_numbering(e, ali, path, out):
     --------
     fix_numbering : Corrects insertion code issues after transfer.
     """
+    from modeller import alignment, model
+
     # Read the alignment for the transfer
     aln = alignment(e, file=ali)
 
@@ -312,7 +313,7 @@ def transfer_numbering(e, ali, path, out):
     file=os.path.basename(out)
     mdl_built.write(file)
 
-    with open(file, 'r') as f:
+    with open(file, 'r', errors='replace') as f:
         content = f.read()
 
     corrected_content = fix_numbering(content)
@@ -409,6 +410,10 @@ def build_model(residues, pdb, path, ali, out, optimize=1):
     The output PDB file will have residue numbering transferred from the
     template. Modeller intermediate files are cleaned up automatically.
     """
+    from modeller import log, Environ, Selection
+    from modeller.automodel import AutoModel
+
+    log.none()
     ali = os.path.abspath(ali)
     cwd = os.getcwd()
     dir = os.path.dirname(os.path.abspath(out))

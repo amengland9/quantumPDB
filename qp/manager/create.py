@@ -125,7 +125,7 @@ def ligand_in_spheres(ligand, structure_dir, num_sphere):
         True if the ligand (all residues for oligomers) is found.
     """
     ligand_residues = ligand.split()
-    partial_found = False
+    not_found = []
     for ligand_residue in ligand_residues:
         res_name, res_id_full = ligand_residue.split('_')
         chain = res_id_full[0]
@@ -134,14 +134,17 @@ def ligand_in_spheres(ligand, structure_dir, num_sphere):
         for i in range(num_sphere + 1):
             sphere_path = os.path.join(structure_dir, f"{i}.pdb")
             if residue_exists(sphere_path, res_name, chain, res_id):
-                partial_found = True
                 break
-        else: # if ligand residue is not found in any sphere
-            if len(ligand_residues) > 1 and partial_found:
-                print(f"For oligomer ligand {ligand}, {ligand_residue} is partially found in spheres. This will cause unpredictable charge error!")
-                pass
-            return False
-    return True
+        else: # if any ligand residue is not found in any sphere
+            not_found.append(ligand_residue)
+    if not not_found:
+        return True
+    if len(ligand_residues) > 1 and len(not_found) < len(ligand_residues):
+        print(
+            f"For oligomer ligand {ligand}, {', '.join(not_found)} not found "
+            f"in spheres {structure_dir}. This will cause unpredictable charge error!"
+        )
+    return False
 
 
 def get_electronic(pdb_id, pdb_list_path):
@@ -312,7 +315,14 @@ def create_jobs(pdb_list_path, output_dir, optimization, basis, method, guess, u
     pdb_dirs = sorted([d for d in os.listdir() if os.path.isdir(d) and not d == 'Protoss'])
     for pdb in pdb_dirs:
         pdb_dir_path = os.path.join(base_dir, pdb)
-        structure_dirs = sorted(glob.glob(os.path.join(pdb_dir_path, '[A-Z][0-9]*')))
+        # Match any cluster subdirectory, regardless of naming scheme
+        # (default residue-based, e.g. A199, or a custom
+        # cluster_name_template, e.g. A_4). Previously this only matched
+        # '[A-Z][0-9]*', which silently skipped non-residue-based names.
+        structure_dirs = sorted([
+            os.path.join(pdb_dir_path, d) for d in os.listdir(pdb_dir_path)
+            if os.path.isdir(os.path.join(pdb_dir_path, d)) and d != 'Protoss'
+        ])
         
         if len(structure_dirs) == 0:
             continue

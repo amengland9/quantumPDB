@@ -6,6 +6,8 @@ import sys
 import yaml
 import requests
 
+from qp.structure.mmcif_to_pdb import OversizedStructureError, convert_mmcif_to_pdb
+
 
 def read_config(config_file):
     """Read and parse a YAML configuration file.
@@ -24,28 +26,45 @@ def read_config(config_file):
         return yaml.safe_load(file)
 
 
-def parse_input(input, output, center_yaml_residues):
+def parse_input(input, output, center_yaml_residues, force_include_yaml_residues=None, force_remove_yaml_residues=None):
     """Parse input sources and determine center residues for each structure.
 
     Processes the user-provided input (PDB codes, file paths, or CSV) and
     determines the center residue definitions from either the CSV ``center``
-    column or the YAML ``center_residues`` parameter.
+    column or the YAML ``center_residues`` parameter. Also resolves the
+    per-PDB ``force_include_residues`` and ``force_remove_residues`` lists
+    from either their CSV column or their YAML parameter, using the same
+    CSV-takes-priority precedence as centers.
 
     Parameters
     ----------
     input : str or list
-        Input specification: PDB code(s), path to PDB file(s), or path to CSV.
+        Input specification: PDB code(s), path to PDB/mmCIF file(s), or path to CSV.
     output : str
         Path to the output directory.
     center_yaml_residues : list
         Center residue definitions from the YAML config file.
+    force_include_yaml_residues : list, optional
+        Additional protein residue keys (``'RESNAME_CHAINID'``, e.g.
+        ``'HIS_A123'``) from the YAML config file, applied to every PDB
+        when the CSV has no ``force_include_residues`` column (default None,
+        treated as []).
+    force_remove_yaml_residues : list, optional
+        Protein residue keys (``'RESNAME_CHAINID'``) to force-exclude, from
+        the YAML config file, applied to every PDB when the CSV has no
+        ``force_remove_residues`` column (default None, treated as []).
 
     Returns
     -------
-    tuple of (list, list)
-        ``(pdb_all, center_residues)`` where ``pdb_all`` is a list of
-        ``(pdb_id, pdb_path)`` tuples and ``center_residues`` is a list
-        of center definition strings.
+    tuple of (list, list, list, list)
+        ``(pdb_all, center_residues, force_include_residues,
+        force_remove_residues)`` where ``pdb_all`` is a list of
+        ``(pdb_id, pdb_path, source_cif)`` tuples, ``center_residues`` is a
+        list of center definition strings, and ``force_include_residues``/
+        ``force_remove_residues`` are each a list (one entry per PDB) of
+        lists of ``'RESNAME_CHAINID'`` residue keys to force-include/exclude
+        for that PDB. ``source_cif`` is a local mmCIF path when the user
+        supplied ``.cif``/``.mmcif``, otherwise ``None``.
 
     Raises
     ------
@@ -58,6 +77,8 @@ def parse_input(input, output, center_yaml_residues):
         input = [input]
     output = os.path.abspath(output)
     center_csv_residues = get_centers(input)
+    force_include_csv_residues = get_force_include_residues(input)
+    force_remove_csv_residues = get_force_remove_residues(input)
     pdb_all = get_pdbs(input, output)
 
     # Determine how the user has decided to provide the center residues
@@ -79,12 +100,30 @@ def parse_input(input, output, center_yaml_residues):
             sys.exit("> No more center residues available.")
         center_residues = center_yaml_residues
 
-    return pdb_all, center_residues
+    # Determine the force-included residues for each PDB
+    if force_include_csv_residues:
+        print("> Using force-included residues from the input csv\n")
+        force_include_residues = [[t for t in row.split("-") if t] for row in force_include_csv_residues]
+    else:
+        force_include_residues = [list(force_include_yaml_residues or []) for _ in pdb_all]
+
+    # Determine the force-excluded residues for each PDB
+    if force_remove_csv_residues:
+        print("> Using force-excluded residues from the input csv\n")
+        force_remove_residues = [[t for t in row.split("-") if t] for row in force_remove_csv_residues]
+    else:
+        force_remove_residues = [list(force_remove_yaml_residues or []) for _ in pdb_all]
+
+    return pdb_all, center_residues, force_include_residues, force_remove_residues
 
 
 def fetch_pdb(pdb, out):
     """
-    Fetches the PDB file for a given PDB code.
+    Fetch a structure for a PDB code, falling back to mmCIF when needed.
+
+    Tries the classic PDB download first. If RCSB returns 404 (common for
+    entries with ``pdb_format_compatible = N``), downloads the mmCIF and
+    converts it to ``out``.
 
     Parameters
     ----------
@@ -93,31 +132,84 @@ def fetch_pdb(pdb, out):
     out: str
         Path to output PDB file
 
+    Returns
+    -------
+    str
+        ``"pdb"`` if a classic PDB was downloaded, or ``"mmcif"`` if the
+        file was obtained via mmCIF conversion.
+
     Raises
     ------
     ValueError
-        If the PDB ID returns a 404 error (invalid user input).
+        If neither PDB nor mmCIF is available for the ID.
     IOError
         If there is a network or server-side error.
     """
-    url = f"https://files.rcsb.org/view/{pdb}.pdb"
+    pdb = pdb.strip()
+    out = os.path.abspath(out)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+
+    pdb_url = f"https://files.rcsb.org/download/{pdb}.pdb"
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(pdb_url, timeout=30)
     except requests.exceptions.RequestException as e:
-        # Raise an IOError for network-level problems
         raise IOError(f"Could not connect to the server. Details: {e}")
 
-    # Check the status code from the server's response
     if r.status_code == 200:
-        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
         with open(out, "w") as f:
             f.write(r.text)
-    elif r.status_code == 404:
-        # Raise a ValueError for an invalid PDB ID
-        raise ValueError(f"PDB ID '{pdb}' is not valid or does not exist.")
-    else:
-        # Raise an IOError for other server-side problems
+        return "pdb"
+    if r.status_code != 404:
         raise IOError(f"Server returned an error with status code {r.status_code}.")
+
+    # Classic PDB unavailable — try mmCIF (entries marked pdb_format_compatible=N)
+    print(f"> PDB unavailable for {pdb}; fetching mmCIF")
+    cif_url = f"https://files.rcsb.org/download/{pdb}.cif"
+    try:
+        r_cif = requests.get(cif_url, timeout=60)
+    except requests.exceptions.RequestException as e:
+        raise IOError(f"Could not connect to the server. Details: {e}")
+
+    if r_cif.status_code == 404:
+        raise ValueError(f"PDB ID '{pdb}' is not valid or does not exist.")
+    if r_cif.status_code != 200:
+        raise IOError(f"Server returned an error with status code {r_cif.status_code}.")
+
+    cif_path = os.path.join(os.path.dirname(out), f"{pdb}.cif")
+    with open(cif_path, "w") as f:
+        f.write(r_cif.text)
+    print(f"> Converting mmCIF → PDB ({cif_path})")
+    convert_mmcif_to_pdb(cif_path, out)
+    return "mmcif"
+
+
+def ensure_structure_pdb(pdb_id, pdb_path, source_cif=None):
+    """Ensure ``pdb_path`` exists as a classic PDB, converting mmCIF if needed.
+
+    Parameters
+    ----------
+    pdb_id : str
+        Structure identifier (PDB code or local basename).
+    pdb_path : str
+        Target classic PDB path used by the rest of the pipeline.
+    source_cif : str or None
+        Optional local mmCIF path to convert when ``pdb_path`` is missing.
+
+    Returns
+    -------
+    str
+        One of ``"exists"``, ``"converted"``, ``"pdb"``, or ``"mmcif"``.
+    """
+    pdb_path = os.path.abspath(pdb_path)
+    if os.path.isfile(pdb_path):
+        return "exists"
+
+    if source_cif:
+        print(f"> Converting mmCIF → PDB ({source_cif})")
+        convert_mmcif_to_pdb(source_cif, pdb_path)
+        return "converted"
+
+    return fetch_pdb(pdb_id, pdb_path)
 
 
 def get_pdbs(input_path, output_path):
@@ -127,42 +219,52 @@ def get_pdbs(input_path, output_path):
     Parameters
     ----------
     input_path: list
-        List of PDB codes, paths to PDB files, or path to CSV file
+        List of PDB codes, paths to PDB/mmCIF files, or path to CSV file
     output_path: str
         Path to output directory
 
     Returns
     -------
     pdb_all
-        List of tuples containing parsed PDB ID and path to PDB file
+        List of ``(pdb_id, pdb_path, source_cif)`` tuples. ``source_cif`` is
+        set for local ``.cif``/``.mmcif`` inputs; otherwise ``None``.
 
 
     Notes
     -----
     Store input PDBs as a tuple of
     Parsed ID (PDB code or filename)
-    Path to PDB file (existing or to download)
+    Path to PDB file (existing or to download/convert)
+    Optional local mmCIF source path
     """
     pdb_all = []
     for pdb_id in input_path:
         if os.path.isfile(pdb_id):
             pdb, ext = os.path.splitext(os.path.basename(pdb_id))
             pdb = pdb.replace(".", "_")
-            if ext == ".pdb":
-                pdb_all.append((pdb, pdb_id))
-            elif ext == ".csv":
+            ext_lower = ext.lower()
+            if ext_lower == ".pdb":
+                pdb_all.append((pdb, pdb_id, None))
+            elif ext_lower in (".cif", ".mmcif"):
+                target = os.path.join(output_path, pdb, f"{pdb}.pdb")
+                pdb_all.append((pdb, target, os.path.abspath(pdb_id)))
+            elif ext_lower == ".csv":
                 with open(pdb_id, "r") as csvfile:
                     reader = csv.DictReader(csvfile)
                     for row in reader:
                         pdb = row['pdb_id']
-                        pdb_all.append((pdb, os.path.join(output_path, pdb, f"{pdb}.pdb")))
+                        pdb_all.append((pdb, os.path.join(output_path, pdb, f"{pdb}.pdb"), None))
             else:
                 with open(pdb_id, "r") as f:
                     pdb_all.extend(
-                        [(pdb, os.path.join(output_path, pdb, f"{pdb}.pdb")) for pdb in f.read().splitlines()]
+                        [
+                            (pdb, os.path.join(output_path, pdb, f"{pdb}.pdb"), None)
+                            for pdb in f.read().splitlines()
+                            if pdb.strip()
+                        ]
                     )
         else:
-            pdb_all.append((pdb_id, os.path.join(output_path, pdb_id, f"{pdb_id}.pdb")))
+            pdb_all.append((pdb_id, os.path.join(output_path, pdb_id, f"{pdb_id}.pdb"), None))
 
     return pdb_all
 
@@ -201,3 +303,83 @@ def get_centers(input_path):
                         if center:
                             centers.append(center)
     return centers
+
+
+def get_force_include_residues(input_path):
+    """
+    Parses the input csv's ``force_include_residues`` column, one entry per row.
+
+    Unlike ``get_centers``, blank cells append an empty string rather than
+    being skipped, since ``force_include_residues`` is optional per PDB and the
+    returned list must stay aligned with the CSV's rows.
+
+    Parameters
+    ----------
+    input_path: list
+        List of pdbs or the input csv file.
+
+    Returns
+    -------
+    force_include_residues: list
+        List of raw ``force_include_residues`` cell values (dash-separated
+        ``'RESNAME_CHAINID'`` tokens, or ``""``), one per CSV row. Empty
+        list if no CSV with an ``force_include_residues`` column is present.
+    """
+
+    force_include_residues = []
+    for pdb_id in input_path:
+        if os.path.isfile(pdb_id):
+            pdb, ext = os.path.splitext(os.path.basename(pdb_id))
+            pdb = pdb.replace(".", "_")
+            if ext == ".csv":
+                input_csv = pdb_id
+                with open(input_csv, "r") as csvfile:
+                    reader = csv.DictReader(csvfile)
+                    # Check if 'force_include_residues' column exists
+                    if 'force_include_residues' not in reader.fieldnames:
+                        print(f"> WARNING: The 'force_include_residues' option is not being used in {input_csv}. Returning empty list.")
+                        return []
+                    # If the column exists, proceed to collect its values
+                    for row in reader:
+                        force_include_residues.append(row.get('force_include_residues', None) or "")
+    return force_include_residues
+
+
+def get_force_remove_residues(input_path):
+    """
+    Parses the input csv's ``force_remove_residues`` column, one entry per row.
+
+    Unlike ``get_centers``, blank cells append an empty string rather than
+    being skipped, since ``force_remove_residues`` is optional per PDB and the
+    returned list must stay aligned with the CSV's rows.
+
+    Parameters
+    ----------
+    input_path: list
+        List of pdbs or the input csv file.
+
+    Returns
+    -------
+    force_remove_residues: list
+        List of raw ``force_remove_residues`` cell values (dash-separated
+        ``'RESNAME_CHAINID'`` tokens, or ``""``), one per CSV row. Empty
+        list if no CSV with an ``force_remove_residues`` column is present.
+    """
+
+    force_remove_residues = []
+    for pdb_id in input_path:
+        if os.path.isfile(pdb_id):
+            pdb, ext = os.path.splitext(os.path.basename(pdb_id))
+            pdb = pdb.replace(".", "_")
+            if ext == ".csv":
+                input_csv = pdb_id
+                with open(input_csv, "r") as csvfile:
+                    reader = csv.DictReader(csvfile)
+                    # Check if 'force_remove_residues' column exists
+                    if 'force_remove_residues' not in reader.fieldnames:
+                        print(f"> WARNING: The 'force_remove_residues' option is not being used in {input_csv}. Returning empty list.")
+                        return []
+                    # If the column exists, proceed to collect its values
+                    for row in reader:
+                        force_remove_residues.append(row.get('force_remove_residues', None) or "")
+    return force_remove_residues
