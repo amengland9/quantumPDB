@@ -46,12 +46,7 @@ Optimization level (``optimize`` argument in ``missing.build_model``):
 
 import os
 import warnings
-from modeller import log, Environ, Selection
-from modeller.automodel import AutoModel
-from modeller import alignment, model
 from Bio import PDB
-
-log.none()
 
 #: Amino acid 3 to 1 lookup table
 def define_residues():
@@ -304,6 +299,8 @@ def transfer_numbering(e, ali, path, out):
     --------
     fix_numbering : Corrects insertion code issues after transfer.
     """
+    from modeller import alignment, model
+
     # Read the alignment for the transfer
     aln = alignment(e, file=ali)
 
@@ -413,6 +410,10 @@ def build_model(residues, pdb, path, ali, out, optimize=1):
     The output PDB file will have residue numbering transferred from the
     template. Modeller intermediate files are cleaned up automatically.
     """
+    from modeller import log, Environ, Selection
+    from modeller.automodel import AutoModel
+
+    log.none()
     ali = os.path.abspath(ali)
     cwd = os.getcwd()
     dir = os.path.dirname(os.path.abspath(out))

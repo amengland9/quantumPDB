@@ -3,7 +3,6 @@
 import os
 
 import numpy as np
-import pytest
 from Bio.PDB import PDBParser, Polypeptide
 
 from qp.cluster.spheres import (
@@ -16,15 +15,7 @@ from qp.cluster.spheres import (
 )
 from qp.manager.create import ligand_in_spheres
 from qp.protonate.ligand_prop import collect_RGP_atoms, parse_ligand_name, read_ligands
-
-MISSING_LICENSE = False
-try:
-    import modeller  # noqa: F401
-except Exception:
-    MISSING_LICENSE = True
-
-if not MISSING_LICENSE:
-    from qp.structure import missing as missing_loops
+from qp.structure import missing as missing_loops
 
 
 SAMPLES = os.path.join(os.path.dirname(__file__), "samples")
@@ -95,7 +86,6 @@ def test_include_ligands_mode_3_excludes_nonwater_ligands(tmpdir):
             assert res.get_resname() == "HOH"
 
 
-@pytest.mark.skipif(MISSING_LICENSE, reason="Modeller license not found")
 def test_get_residues_ter_starts_new_chain_bucket(tmpdir):
     # REMARK 465 columns are fixed-width; pad so line[26] (insertion code) exists.
     pdb_text = """\

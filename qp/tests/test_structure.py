@@ -8,21 +8,19 @@ from qp.protonate import get_protoss, fix
 from qp.protonate.ligand_prop import compute_charge
 from qp.cluster import struct_to_file
 from qp.cluster.spheres import CenterResidue
+from qp.structure import missing as missing_loops
 from qp.tests.protoss_helpers import (
     PROTOSS_NETWORK_ERRORS,
     proteins_plus_reachable,
     skip_if_protoss_unavailable,
 )
 
-# Skip Modeller tests if in Github actions
+# Skip tests that actually invoke Modeller if it is not importable.
 MISSING_LICENSE = False
 try:
-    import modeller
-except:
+    import modeller  # noqa: F401
+except Exception:
     MISSING_LICENSE = True
-
-if not MISSING_LICENSE:
-    from qp.structure import missing as missing_loops
 
 
 # ========== protonate ==========
@@ -109,7 +107,6 @@ def _normalize_ali(text):
     return "".join(lines)
 
 
-@pytest.mark.skipif(MISSING_LICENSE, reason="Modeller license not found")
 @pytest.mark.parametrize("sample_pdb", ["1lm6", "1sp9", "2q4a", "2r6s", "3a8g", "4ilv"], indirect=True)
 def test_write_alignment(tmpdir, sample_pdb):
     pdb, path = sample_pdb

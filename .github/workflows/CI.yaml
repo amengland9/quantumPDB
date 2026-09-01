@@ -30,13 +30,98 @@ on:
           - "3.11"
           - "3.12"
 
+# Two-layer CI:
+# 1. lint / docs / lite tests run on every event, including fork PRs.
+#    They never read MODELLER_LICENSE_KEY (GitHub withholds secrets from
+#    pull_request workflows that originate in a fork).
+# 2. Full Modeller-licensed tests run only when secrets are available:
+#    push to main, schedule, workflow_dispatch, or a PR whose head branch
+#    lives in this repository (not a fork).
 defaults:
   run:
     shell: bash -el {0}
 
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run flake8
+        shell: bash
+        run: |
+          python -m pip install flake8
+          # Catch syntax / undefined-name errors without enforcing style.
+          flake8 qp --count --select=E9,F63,F7,F82 --show-source --statistics
+
+  docs:
+    name: Build Sphinx docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: docs/requirements.yaml
+          environment-name: docs
+          cache-environment: true
+          condarc: |
+            channels:
+              - conda-forge
+            channel_priority: strict
+
+      - name: Install package
+        run: |
+          python -m pip install . --no-deps
+
+      - name: Build HTML documentation
+        run: |
+          cd docs
+          make html
+
+  test-lite:
+    name: Unit tests (no Modeller license)
+    runs-on: ubuntu-latest
+    env:
+      PROTOSS_UPLOAD_RETRIES: "1"
+      PROTOSS_UPLOAD_RETRY_DELAY: "5"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: devtools/conda-envs/test_env_lite.yaml
+          environment-name: test-lite
+          create-args: >-
+            python=3.12
+          cache-environment: true
+          condarc: |
+            channels:
+              - conda-forge
+            channel_priority: strict
+
+      - name: Install package
+        run: |
+          python -m pip install . --no-deps
+          micromamba list
+
+      - name: Run tests that do not require a Modeller license
+        run: |
+          pytest -v --cov=qp --cov-report=xml --color=yes qp/tests/
+
   test:
     name: Test on ${{ github.event.inputs.os || 'ubuntu-latest' }}, Python ${{ github.event.inputs.python-version || '3.12' }}
+    if: >
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ github.event.inputs.os || 'ubuntu-latest' }}
     env:
       # Consumed by the salilab modeller post-link script during install.
@@ -117,28 +202,3 @@ jobs:
           flags: unittests
           name: codecov-${{ github.event.inputs.os || 'ubuntu-latest' }}-py${{ github.event.inputs.python-version || '3.12' }}
           fail_ci_if_error: false
-
-  docs:
-    name: Build Sphinx docs
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: mamba-org/setup-micromamba@v2
-        with:
-          environment-file: docs/requirements.yaml
-          environment-name: docs
-          cache-environment: true
-          condarc: |
-            channels:
-              - conda-forge
-            channel_priority: strict
-
-      - name: Install package
-        run: |
-          python -m pip install . --no-deps
-
-      - name: Build HTML documentation
-        run: |
-          cd docs
-          make html
