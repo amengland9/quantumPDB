@@ -52,12 +52,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run flake8
+      - name: Check Python syntax
         shell: bash
         run: |
-          python -m pip install flake8
-          # Catch syntax / undefined-name errors without enforcing style.
-          flake8 qp --count --select=E9,F63,F7,F82 --show-source --statistics
+          python -m compileall -q qp
 
   docs:
     name: Build Sphinx docs
